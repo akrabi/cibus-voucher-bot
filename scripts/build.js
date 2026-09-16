@@ -11,6 +11,7 @@ await copyFile("src/appsscript.json", "dist/appsscript.json");
 await writeFile("dist/entrypoints.js", [
   "function runImport() { return CibusBot.runImport(); }",
   "function previewImport() { return CibusBot.previewImport(); }",
+  "function checkTelegramConnection() { return CibusBot.checkTelegramConnection(); }",
   "function enableSchedule() { return CibusBot.enableSchedule(); }",
   "function disableSchedule() { return CibusBot.disableSchedule(); }",
 ].join("\n") + "\n");

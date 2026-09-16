@@ -11,6 +11,51 @@ function config() {
   return values;
 }
 
+function telegramRequest(settings, method, payload = {}) {
+  const uncertainCode = method === "sendDocument" ? "TELEGRAM_DELIVERY_UNCERTAIN" : "TELEGRAM_CHECK_FAILED";
+  // File uploads need multipart; JSON preserves integer IDs in read-only requests.
+  const requestBody = method === "sendDocument" ? { payload }
+    : { contentType: "application/json", payload: JSON.stringify(payload) };
+  let response;
+  try {
+    response = UrlFetchApp.fetch(`https://api.telegram.org/bot${settings.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "post", muteHttpExceptions: true, followRedirects: false, ...requestBody,
+    });
+  } catch {
+    throw new VoucherError(uncertainCode);
+  }
+  let body;
+  try {
+    body = JSON.parse(response.getContentText());
+  } catch {
+    throw new VoucherError(uncertainCode);
+  }
+  requireValue(body !== null && typeof body === "object" && !Array.isArray(body), uncertainCode);
+  return { status: response.getResponseCode(), body };
+}
+
+function telegramDetails({ status, body }) {
+  const apiCode = Number.isInteger(body.error_code) ? body.error_code : null;
+  const migration = body.parameters?.migrate_to_chat_id;
+  const suggestedChatId = Number.isSafeInteger(migration) && migration < 0 ? String(migration) : null;
+  const retry = body.parameters?.retry_after;
+  const description = typeof body.description === "string" ? body.description.toLowerCase() : "";
+  let reason = body.ok === true ? "UNEXPECTED_CONFIRMATION" : "REQUEST_REJECTED";
+  if (suggestedChatId) reason = "CHAT_MIGRATED";
+  else if (status === 401 || apiCode === 401) reason = "INVALID_BOT_TOKEN";
+  else if (status === 429 || apiCode === 429) reason = "RATE_LIMITED";
+  else if (description.includes("chat not found")) reason = "CHAT_NOT_FOUND";
+  else if (/invalid user_id|user_id_invalid/.test(description)) reason = "INVALID_USER_ID";
+  else if (/user not found|member not found/.test(description)) reason = "MEMBER_NOT_FOUND";
+  else if (/chat_admin_required|member list is inaccessible/.test(description)) reason = "MEMBER_LOOKUP_FORBIDDEN";
+  else if (/bot was kicked|bot is not a member/.test(description)) reason = "BOT_NOT_IN_CHAT";
+  else if (/not enough rights|have no rights|chat_write_forbidden/.test(description)) reason = "BOT_CANNOT_SEND";
+  else if (status === 403 || apiCode === 403) reason = "BOT_FORBIDDEN";
+  else if (status >= 500) reason = "TELEGRAM_SERVER_ERROR";
+  return { httpStatus: status, apiCode, reason, suggestedChatId,
+    retryAfterSeconds: Number.isSafeInteger(retry) && retry > 0 ? retry : null };
+}
+
 function retryGmail(action) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -147,24 +192,17 @@ function gmailPorts(settings) {
         && /^voucher-\d{6,24}\.png$/.test(image.filename),
         "INVALID_VOUCHER_FILENAME");
       const blob = Utilities.newBlob(Array.from(image.bytes, b => b > 127 ? b - 256 : b), "image/png", image.filename);
-      let response;
-      try {
-        response = UrlFetchApp.fetch(`https://api.telegram.org/bot${settings.TELEGRAM_BOT_TOKEN}/sendDocument`, {
-          method: "post", muteHttpExceptions: true, followRedirects: false,
-          payload: { chat_id: settings.TELEGRAM_CHAT_ID, document: blob, caption: text },
-        });
-      } catch {
-        throw new VoucherError("TELEGRAM_DELIVERY_UNCERTAIN");
-      }
-      let body;
-      try {
-        body = JSON.parse(response.getContentText());
-      } catch {
-        throw new VoucherError("TELEGRAM_DELIVERY_UNCERTAIN");
-      }
-      requireValue(response.getResponseCode() === 200 && body.ok === true
+      const response = telegramRequest(settings, "sendDocument", {
+        chat_id: settings.TELEGRAM_CHAT_ID, document: blob, caption: text,
+      });
+      const { status, body } = response;
+      const confirmed = status === 200 && body.ok === true
         && Number.isInteger(body.result?.message_id)
-        && String(body.result?.chat?.id) === settings.TELEGRAM_CHAT_ID, "TELEGRAM_NOT_CONFIRMED");
+        && String(body.result?.chat?.id) === settings.TELEGRAM_CHAT_ID;
+      if (!confirmed) {
+        console.error(JSON.stringify({ code: "TELEGRAM_RESPONSE_DETAILS", ...telegramDetails(response) }));
+        throw new VoucherError("TELEGRAM_NOT_CONFIRMED");
+      }
     },
     log(id, code, details) { console.error(JSON.stringify({ source: id, code, details })); },
     list(query, limit = 20) {
@@ -202,6 +240,7 @@ export function runImport() {
       const result = importMessage(id, ports);
       results.push(result);
       console.log(JSON.stringify(result));
+      if (result.reason?.startsWith("SENDING_")) break;
       Utilities.sleep(1100);
     }
     return results;
@@ -214,6 +253,43 @@ export function previewImport() {
     const results = ports.list(candidates, 1).map(id => importMessage(id, ports, { dryRun: true }));
     console.log(JSON.stringify(results));
     return results;
+  });
+}
+
+export function checkTelegramConnection() {
+  return locked(() => {
+    const settings = config();
+    function check(method, payload) {
+      const response = telegramRequest(settings, method, payload);
+      if (response.status !== 200 || response.body.ok !== true) {
+        const report = { status: "CHECK_FAILED", method, ...telegramDetails(response) };
+        console.error(JSON.stringify(report));
+        return { failure: report };
+      }
+      requireValue(response.body.result && typeof response.body.result === "object", "TELEGRAM_CHECK_FAILED");
+      return { result: response.body.result };
+    }
+    const chat = check("getChat", { chat_id: settings.TELEGRAM_CHAT_ID });
+    if (chat.failure) return chat.failure;
+    requireValue(String(chat.result.id) === settings.TELEGRAM_CHAT_ID, "TELEGRAM_CHAT_ID_MISMATCH");
+    requireValue(["group", "supergroup"].includes(chat.result.type), "TELEGRAM_GROUP_REQUIRED");
+    const me = check("getMe");
+    if (me.failure) return me.failure;
+    requireValue(Number.isSafeInteger(me.result.id) && me.result.is_bot === true, "TELEGRAM_CHECK_FAILED");
+    const member = check("getChatMember", { chat_id: settings.TELEGRAM_CHAT_ID, user_id: me.result.id });
+    if (member.failure) return member.failure;
+    requireValue(member.result.user?.id === me.result.id, "TELEGRAM_CHECK_FAILED");
+    const status = member.result.status;
+    const admin = ["creator", "administrator"].includes(status);
+    const active = ["member", "restricted"].includes(status) || admin;
+    const permissions = status === "restricted" ? member.result : chat.result.permissions;
+    const canSend = active && (admin || (member.result.is_member !== false
+      && permissions?.can_send_messages !== false && permissions?.can_send_documents !== false));
+    const report = { status: canSend ? "CONNECTION_OK" : "CHECK_FAILED",
+      reason: canSend ? "NO_KNOWN_SEND_RESTRICTION" : "BOT_CANNOT_SEND", chatType: chat.result.type };
+    if (canSend) console.log(JSON.stringify(report));
+    else console.error(JSON.stringify(report));
+    return report;
   });
 }
 

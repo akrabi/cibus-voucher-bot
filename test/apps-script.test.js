@@ -373,6 +373,124 @@ test("Telegram requires 200, ok:true, integer message id and the configured dest
   }
 });
 
+test("Telegram failures expose actionable codes without raw responses or voucher data", () => {
+  for (const [status, body, reason] of [
+    [400, { error_code: 400, parameters: { migrate_to_chat_id: -100123456 } }, "CHAT_MIGRATED"],
+    [429, { error_code: 429, parameters: { retry_after: 30 } }, "RATE_LIMITED"],
+    [401, { error_code: 401 }, "INVALID_BOT_TOKEN"],
+    [400, { description: `Bad Request: chat not found ${CODE}` }, "CHAT_NOT_FOUND"],
+    [400, { description: `Bad Request: invalid user_id specified ${CODE}` }, "INVALID_USER_ID"],
+    [400, { description: `Bad Request: user not found ${CODE}` }, "MEMBER_NOT_FOUND"],
+    [400, { description: `Bad Request: member list is inaccessible ${CODE}` }, "MEMBER_LOOKUP_FORBIDDEN"],
+    [403, { description: `Forbidden: bot was kicked ${CODE}` }, "BOT_NOT_IN_CHAT"],
+    [403, { description: `not enough rights to send ${CODE}` }, "BOT_CANNOT_SEND"],
+    [500, {}, "TELEGRAM_SERVER_ERROR"],
+  ]) {
+    const r = runtime({ telegram: () => ({ status, text: JSON.stringify({ ok: false, ...body }) }) });
+    assert.equal(r.api.runImport()[0].reason, "SENDING_TELEGRAM_NOT_CONFIRMED");
+    const detail = r.operations("error").map(e => JSON.parse(e.text))
+      .find(e => e.code === "TELEGRAM_RESPONSE_DETAILS");
+    assert.equal(detail.reason, reason);
+    assert.equal(detail.httpStatus, status);
+    assert.equal(detail.retryAfterSeconds, body.parameters?.retry_after ?? null);
+    assert.equal(detail.suggestedChatId,
+      body.parameters?.migrate_to_chat_id ? String(body.parameters.migrate_to_chat_id) : null);
+    assert.ok(!JSON.stringify(r.operations("error")).includes(CODE));
+    assert.ok(!JSON.stringify(r.operations("error")).includes("synthetic_test_token"));
+  }
+});
+
+test("a send failure stops the batch without claiming or reviewing further vouchers", () => {
+  const r = runtime({
+    messages: [mimeMessage("source-1"), mimeMessage("source-2")],
+    telegram: () => ({ status: 429, text: JSON.stringify({ ok: false, error_code: 429 }) }),
+  });
+  assert.equal(r.api.runImport().length, 1);
+  assert.equal(r.count("telegram"), 1);
+  assert.deepEqual(r.messages.get("source-2").labels, [LABELS.candidate, "INBOX"]);
+  assert.equal(r.count("get"), 1);
+});
+
+test("read-only Telegram check uses JSON integer IDs while imports are disabled and does not access vouchers", () => {
+  const botId = 7999999999;
+  const r = runtime({ properties: { IMPORT_ENABLED: "false" }, telegram: (url, init) => {
+    const method = url.split("/").at(-1);
+    assert.equal(init.contentType, "application/json");
+    assert.equal(typeof init.payload, "string");
+    const payload = JSON.parse(init.payload);
+    if (method === "getChatMember") {
+      assert.deepEqual(payload, { chat_id: "-123456", user_id: botId });
+      assert.ok(init.payload.includes('"user_id":7999999999'));
+    }
+    const result = {
+      getChat: { id: -123456, type: "supergroup", title: "private-title", permissions: { can_send_documents: true } },
+      getMe: { id: botId, is_bot: true, username: "private-bot" },
+      getChatMember: { status: "member", user: { id: botId } },
+    }[method];
+    assert.ok(result, "diagnostic must not send a message");
+    return { status: 200, text: JSON.stringify({ ok: true, result }) };
+  } });
+  assert.deepEqual(json(r.api.checkTelegramConnection()), {
+    status: "CONNECTION_OK", reason: "NO_KNOWN_SEND_RESTRICTION", chatType: "supergroup",
+  });
+  assert.equal(r.count("modify"), 0);
+  assert.equal(r.count("get"), 0);
+  assert.equal(r.count("list"), 0);
+  assert.equal(r.count("labels-list"), 0);
+  assert.equal(r.count("telegram"), 3);
+  assert.ok(!JSON.stringify(r.operations("log")).includes("private-"));
+});
+
+test("read-only Telegram check reports migrated group ID without changing configuration or sending", () => {
+  const r = runtime({ properties: { IMPORT_ENABLED: "false" }, telegram: url => {
+    assert.ok(url.endsWith("/getChat"));
+    return { status: 400, text: JSON.stringify({ ok: false, error_code: 400,
+      description: `private response ${CODE}`, parameters: { migrate_to_chat_id: -100123456 } }) };
+  } });
+  const result = r.api.checkTelegramConnection();
+  assert.equal(result.status, "CHECK_FAILED");
+  assert.equal(result.reason, "CHAT_MIGRATED");
+  assert.equal(result.suggestedChatId, "-100123456");
+  assert.equal(r.properties.TELEGRAM_CHAT_ID, "-123456");
+  assert.equal(r.count("telegram"), 1);
+  assert.equal(r.count("modify"), 0);
+  assert.ok(!JSON.stringify(r.operations("error")).includes(CODE));
+});
+
+test("Telegram check respects group permissions, bot restrictions and admin exemption", () => {
+  for (const [status, membership, permissions, expected] of [
+    ["member", {}, { can_send_documents: false }, "CHECK_FAILED"],
+    ["member", {}, { can_send_messages: false }, "CHECK_FAILED"],
+    ["administrator", {}, { can_send_documents: false }, "CONNECTION_OK"],
+    ["restricted", { is_member: false, can_send_documents: true }, {}, "CHECK_FAILED"],
+    ["restricted", { is_member: true, can_send_documents: false }, {}, "CHECK_FAILED"],
+    ["left", {}, {}, "CHECK_FAILED"],
+    ["kicked", {}, {}, "CHECK_FAILED"],
+  ]) {
+    const r = runtime({ telegram: url => {
+      const result = {
+        getChat: { id: -123456, type: "supergroup", permissions },
+        getMe: { id: 123, is_bot: true },
+        getChatMember: { status, user: { id: 123 }, ...membership },
+      }[url.split("/").at(-1)];
+      assert.ok(result);
+      return { status: 200, text: JSON.stringify({ ok: true, result }) };
+    } });
+    assert.equal(r.api.checkTelegramConnection().status, expected);
+    assert.equal(r.count("modify"), 0);
+  }
+});
+
+test("malformed Telegram responses fail safely without sending diagnostic messages", () => {
+  for (const text of ["null", "[]", "not-json"]) {
+    const r = runtime({ telegram: () => ({ status: 200, text }) });
+    assert.throws(() => r.api.checkTelegramConnection(), error => error.code === "TELEGRAM_CHECK_FAILED");
+    assert.equal(r.count("telegram"), 1);
+    assert.equal(r.count("modify"), 0);
+    assert.equal(r.count("unlock"), 1);
+  }
+});
+
 test("provider fetches use bounded redirects, signed response bytes and explicit User-Agent", () => {
   const r = runtime({
     messages: [mimeMessage("source-1", message({ html: html({ fallback: true }), attachments: [] }))],

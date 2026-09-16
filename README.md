@@ -255,6 +255,33 @@ a Telegram send automatically after failure or uncertainty**. It retries
 idempotent Gmail finalization up to three times. Failed/uncertain deliveries
 remain unarchived and are marked for review. If a label mutation was accepted
 by Gmail but its response was lost, reconcile the actual Gmail state.
+The current batch stops after a send failure so a broken destination or rate
+limit does not mark every remaining voucher for review.
+
+### Telegram connection problems
+
+Set `IMPORT_ENABLED=false` while investigating, then run
+`checkTelegramConnection` from `entrypoints.gs`. It checks the configured group,
+bot membership, and known document-sending restrictions without reading voucher
+emails, changing labels, sending messages, or modifying script properties.
+`CONNECTION_OK` means those checks passed, not that a real send is guaranteed.
+Read-only Telegram requests use JSON to preserve numeric bot IDs exactly;
+voucher uploads continue to use multipart form data for the PNG attachment.
+
+If the group was upgraded to a supergroup (for example during administrator
+changes), Telegram may report `CHAT_MIGRATED` with a `suggestedChatId`. After
+confirming this is your intended group, copy the entire suggested ID into
+`TELEGRAM_CHAT_ID` and rerun the connection check. The script never changes the
+destination automatically.
+
+Send failures report safe `TELEGRAM_RESPONSE_DETAILS` such as HTTP/API status,
+`CHAT_NOT_FOUND`, `BOT_CANNOT_SEND`, or `RATE_LIMITED`, plus a retry-after delay
+when supplied. They do not log raw Telegram descriptions, tokens, or voucher
+contents. A Telegram-supplied replacement group ID may appear on migration.
+Membership-check errors distinguish `INVALID_USER_ID`, `MEMBER_NOT_FOUND`,
+and `MEMBER_LOOKUP_FORBIDDEN` when Telegram provides that information.
+For uncertain deliveries, inspect the group before clearing Processing or
+Review-needed: a missing confirmation does not prove that nothing was sent.
 
 ### Manual review
 
