@@ -2,6 +2,7 @@
   "name": "cibus-voucher-bot",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Import Cibus voucher images from Gmail into a private Telegram group.",
   "engines": { "node": ">=22" },

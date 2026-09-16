@@ -286,10 +286,36 @@ format flags (alphabet, whitespace, unexpected characters), never body content.
 
 ## Repository and deployment
 
-Maintain a **private** GitHub repository. Commit source, this guide, tests, and
-`package-lock.json`; never commit real mail, voucher images, signed URLs, bot
-tokens, `.clasp.json`, or authentication files. `.gitignore` is a safety net,
-not a substitute for checking staged files.
+The **source code can be public**. Keep each installation's Apps Script project,
+Gmail account, Telegram group, and credentials private. Each person deploying
+the project uses their own accounts, bot, and restricted script properties;
+publishing the source does not publish or grant access to a running installation.
+
+Commit source, documentation, synthetic tests, and `package-lock.json`. Never
+commit real mail, voucher images or numbers, signed URLs, account addresses,
+bot tokens, `.clasp.json`, or authentication files. Keep real samples outside
+the repository or in the ignored `private` directory. `.gitignore` is a safety
+net, not a substitute for checking staged files or existing Git history.
+
+Before the first public push:
+
+- Review all commits being published, not only the current files. Deleting a
+  secret in a later commit does not remove it from history. If credentials
+  were exposed, revoke or rotate them; for exposed vouchers, contact the issuer.
+- Confirm you are comfortable making the existing Git author/committer identity
+  public. A GitHub no-reply email protects your personal email address but can
+  still identify your GitHub account.
+- In the GitHub repository's security settings, confirm secret scanning is
+  active and enable repository push protection. These are GitHub-side settings,
+  not settings this repository can enable locally. Automated detection may not
+  recognize voucher numbers, barcode images, or every private link.
+- Use only synthetic examples in public issues, pull requests, and screenshots.
+  Do not attach real emails, redeemable barcodes, credentials, or raw diagnostic
+  dumps. For troubleshooting, share the fixed error codes and redacted preview
+  output instead.
+
+`"private": true` in `package.json` deliberately prevents accidental publication
+to the npm registry. It does not restrict GitHub repository visibility.
 
 After a code change:
 
@@ -300,6 +326,12 @@ npm.cmd run push
 
 No web-app deployment or public endpoint is needed. Triggers execute the
 pushed source. Keep automatic CI deployment out of the initial setup.
+
+## License
+
+The project source is available under the [MIT License](LICENSE). Third-party
+dependencies retain their own licenses. The license does not grant rights to
+Cibus/Pluxee branding or to anyone's voucher data or accounts.
 
 References: [Apps Script/clasp](https://developers.google.com/apps-script/guides/clasp),
 [Telegram Bot API](https://core.telegram.org/bots/api),
