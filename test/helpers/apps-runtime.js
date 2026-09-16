@@ -12,15 +12,16 @@ export const signed = bytes => Array.from(bytes, byte => byte > 127 ? byte - 256
 const encoded = bytes => Buffer.from(bytes).toString("base64url");
 export const json = value => JSON.parse(JSON.stringify(value));
 
-export function mimeMessage(id = "source-1", source = fixtureMessage(), { externalHtml = false } = {}) {
+export function mimeMessage(id = "source-1", source = fixtureMessage(), { externalHtml = false, dataFormat = "bytes" } = {}) {
+  const encode = dataFormat === "base64" ? encoded : signed;
   const htmlBytes = Buffer.from(source.html, "utf8");
   const external = {};
   const htmlBody = externalHtml
-    ? (external["synthetic-html"] = encoded(htmlBytes), { attachmentId: "synthetic-html", size: htmlBytes.length })
-    : { data: encoded(htmlBytes), size: htmlBytes.length };
+    ? (external["synthetic-html"] = encode(htmlBytes), { attachmentId: "synthetic-html", size: htmlBytes.length })
+    : { data: encode(htmlBytes), size: htmlBytes.length };
   const images = source.attachments.map((attachment, i) => {
     const attachmentId = `synthetic-image-${i}`;
-    external[attachmentId] = encoded(attachment.bytes);
+    external[attachmentId] = encode(attachment.bytes);
     return {
       mimeType: attachment.contentType, filename: attachment.filename,
       headers: [{ name: "Content-ID", value: `<${attachment.contentId}>` }],
@@ -34,7 +35,7 @@ export function mimeMessage(id = "source-1", source = fixtureMessage(), { extern
       headers: [{ name: "From", value: source.from }, { name: "Subject", value: source.subject }],
       parts: [{
         mimeType: "multipart/alternative", parts: [
-          { mimeType: "text/plain", body: { data: encoded(Buffer.from("Synthetic plain text")) } },
+          { mimeType: "text/plain", body: { data: encode(Buffer.from("Synthetic plain text")) } },
           { mimeType: "text/html", body: htmlBody },
         ],
       }, ...images, {
@@ -86,6 +87,10 @@ export function runtime(options = {}) {
       sleep: milliseconds => record("sleep", { milliseconds }),
       base64DecodeWebSafe: data => {
         record("decode", { data });
+        if (typeof data !== "string" || data.length % 4 !== 0
+          || !/^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2}==|[A-Za-z0-9_-]{3}=)?$/.test(data)) {
+          throw new Error("Strict web-safe decoder requires valid padded Base64");
+        }
         return signed(Buffer.from(data, "base64url"));
       },
       computeDigest: (_algorithm, text, charset) => {
@@ -183,8 +188,11 @@ export function runtime(options = {}) {
         record("new-trigger", { handler });
         const builder = {
           timeBased: () => builder,
-          everyMinutes: minutes => { record("trigger-minutes", { minutes }); return builder; },
+          atHour: hour => { record("trigger-hour", { hour }); return builder; },
+          everyDays: days => { record("trigger-days", { days }); return builder; },
+          inTimezone: timezone => { record("trigger-timezone", { timezone }); return builder; },
           create: () => {
+            if (options.failTriggerCreate) throw new Error("synthetic trigger creation failure");
             const trigger = { getHandlerFunction: () => handler };
             triggers.push(trigger);
             record("trigger-create", { handler });
@@ -195,6 +203,7 @@ export function runtime(options = {}) {
       },
       deleteTrigger: trigger => {
         record("trigger-delete", { handler: trigger.getHandlerFunction() });
+        if (options.failTriggerDelete?.(trigger)) throw new Error("synthetic trigger deletion failure");
         triggers.splice(triggers.indexOf(trigger), 1);
       },
     },

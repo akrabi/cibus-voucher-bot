@@ -10,8 +10,8 @@
     "test": "node --test",
     "check": "npm test && npm run build",
     "inspect-email": "node scripts/inspect-email.js",
-    "clasp": "clasp",
-    "push": "npm run build && clasp push"
+    "clasp": "clasp -A .clasprc.json -u cibus-voucher-bot",
+    "push": "npm run build && clasp -A .clasprc.json -u cibus-voucher-bot push"
   },
   "dependencies": {
     "@sinonjs/text-encoding": "^0.7.3",

@@ -46,9 +46,47 @@ function gmailPorts(settings) {
     }, "me", id));
   }
   function rawBytes(body, id) {
-    const data = body.data ?? (body.attachmentId
-      ? Gmail.Users.Messages.Attachments.get("me", id, body.attachmentId).data : "");
-    return new Uint8Array(Utilities.base64DecodeWebSafe(data).map(b => b & 255));
+    const data = body?.data ?? (body?.attachmentId
+      ? Gmail.Users.Messages.Attachments.get("me", id, body.attachmentId).data : undefined);
+    requireValue(data != null, "MISSING_GMAIL_BODY_DATA");
+    function checkedBytes(bytes) {
+      requireValue(body?.size == null || bytes.length === body.size, "GMAIL_BODY_SIZE_MISMATCH");
+      return bytes;
+    }
+    // The Apps Script advanced service can expose decoded bytes instead of REST Base64 text.
+    if (Array.isArray(data)) {
+      requireValue(Array.from(data).every(byte => Number.isInteger(byte) && byte >= -128 && byte <= 255),
+        "INVALID_GMAIL_BODY_BYTES");
+      return checkedBytes(new Uint8Array(Array.from(data, byte => byte & 255)));
+    }
+    function invalidEncoding() {
+      const text = typeof data === "string" ? data : "";
+      console.error(JSON.stringify({
+        source: id, code: "GMAIL_BODY_ENCODING_DETAILS",
+        dataType: typeof data, isArray: Array.isArray(data),
+        lengthModuloFour: typeof data === "string" ? data.length % 4 : null,
+        standardAlphabet: /[+/]/.test(text), urlSafeAlphabet: /[-_]/.test(text),
+        whitespace: /[ \t\r\n]/.test(text),
+        unexpectedCharacters: /[^A-Za-z0-9+/_= \t\r\n-]/.test(text),
+      }));
+      throw new VoucherError("INVALID_GMAIL_BODY_ENCODING");
+    }
+    if (typeof data !== "string") invalidEncoding();
+    const normalized = data.replace(/[ \t\r\n]/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+    if (!/^[A-Za-z0-9_-]*={0,2}$/.test(normalized)) invalidEncoding();
+    const unpadded = normalized.replace(/=+$/, "");
+    const padding = (4 - unpadded.length % 4) % 4;
+    if (unpadded.length % 4 === 1
+      || (normalized !== unpadded && normalized.length - unpadded.length !== padding)) invalidEncoding();
+    // Normalize both Base64 alphabets and restore padding for the native decoder.
+    const padded = unpadded + "=".repeat(padding);
+    let bytes;
+    try {
+      bytes = new Uint8Array(Array.from(Utilities.base64DecodeWebSafe(padded), b => b & 255));
+    } catch {
+      throw new VoucherError("GMAIL_BODY_DECODE_FAILED");
+    }
+    return checkedBytes(bytes);
   }
   function getMessage(id) {
     const message = Gmail.Users.Messages.get("me", id, { format: "full" });
@@ -105,7 +143,10 @@ function gmailPorts(settings) {
         text: /^text\/html/i.test(contentType) ? response.getContentText("UTF-8") : undefined };
     },
     send(image, text) {
-      const blob = Utilities.newBlob(Array.from(image.bytes, b => b > 127 ? b - 256 : b), "image/png", "voucher.png");
+      requireValue(typeof image.filename === "string" && image.filename === image.filename.trim()
+        && /^voucher-\d{6,24}\.png$/.test(image.filename),
+        "INVALID_VOUCHER_FILENAME");
+      const blob = Utilities.newBlob(Array.from(image.bytes, b => b > 127 ? b - 256 : b), "image/png", image.filename);
       let response;
       try {
         response = UrlFetchApp.fetch(`https://api.telegram.org/bot${settings.TELEGRAM_BOT_TOKEN}/sendDocument`, {
@@ -125,7 +166,7 @@ function gmailPorts(settings) {
         && Number.isInteger(body.result?.message_id)
         && String(body.result?.chat?.id) === settings.TELEGRAM_CHAT_ID, "TELEGRAM_NOT_CONFIRMED");
     },
-    log(id, code) { console.error(JSON.stringify({ source: id, code })); },
+    log(id, code, details) { console.error(JSON.stringify({ source: id, code, details })); },
     list(query, limit = 20) {
       return (Gmail.Users.Messages.list("me", { q: query, maxResults: limit }).messages || []).map(m => m.id);
     },
@@ -177,15 +218,25 @@ export function previewImport() {
 }
 
 export function enableSchedule() {
-  const settings = config();
-  requireValue(settings.IMPORT_ENABLED === "true", "IMPORT_DISABLED");
-  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === "runImport")) {
-    ScriptApp.newTrigger("runImport").timeBased().everyMinutes(5).create();
-  }
+  return locked(() => {
+    const settings = config();
+    requireValue(settings.IMPORT_ENABLED === "true", "IMPORT_DISABLED");
+    const previous = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === "runImport");
+    const replacement = ScriptApp.newTrigger("runImport").timeBased()
+      .atHour(9).everyDays(1).inTimezone("Asia/Jerusalem").create();
+    try {
+      for (const trigger of previous) ScriptApp.deleteTrigger(trigger);
+    } catch (error) {
+      ScriptApp.deleteTrigger(replacement);
+      throw error;
+    }
+  });
 }
 
 export function disableSchedule() {
-  for (const trigger of ScriptApp.getProjectTriggers()) {
-    if (trigger.getHandlerFunction() === "runImport") ScriptApp.deleteTrigger(trigger);
-  }
+  return locked(() => {
+    for (const trigger of ScriptApp.getProjectTriggers()) {
+      if (trigger.getHandlerFunction() === "runImport") ScriptApp.deleteTrigger(trigger);
+    }
+  });
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseVoucher, caption, purchaseDate, decodeHtml, attributes } from "../src/parser.js";
+import { parseVoucher, caption, voucherFilename, purchaseDate, decodeHtml, attributes } from "../src/parser.js";
 import { CODE, CID, FALLBACK, html, message, errorCode } from "./helpers/fixtures.js";
 
 test("parses a synthetic Hebrew voucher's value and purchase date without an expiry", () => {
@@ -10,8 +10,8 @@ test("parses a synthetic Hebrew voucher's value and purchase date without an exp
     retailer: "חנות בדיקה", imageReference: CID, fallbackUrl: null,
   });
   assert.equal(caption(voucher, "message_1"),
-    "חנות בדיקה\nValue: ILS 123.45\nPurchased: 16 Sep 2026\nSource: message_1");
-  assert.ok(!caption(voucher, "message_1").includes(CODE));
+    `חנות בדיקה\nValue: ILS 123.45\nPurchased: 16 Sep 2026\nVoucher: ${CODE}\nSource: message_1`);
+  assert.equal(voucherFilename(voucher), `voucher-${CODE}.png`);
   assert.ok(!caption(voucher, "message_1").includes("Expiry"));
 });
 
@@ -104,15 +104,32 @@ test("identical fallback links are deduplicated, different ones require review",
   })), errorCode("AMBIGUOUS_FALLBACK"));
 });
 
-test("caption excludes bearer data and rejects unsafe source IDs and oversized captions", () => {
+test("caption includes the voucher number but excludes private links; previews redact the number", () => {
   const voucher = parseVoucher(message({ html: html({ fallback: true }) }));
   const text = caption(voucher, "synthetic-id");
-  assert.ok(!text.includes(CODE));
+  assert.ok(text.includes(`Voucher: ${CODE}`));
   assert.ok(!text.includes(FALLBACK));
+  const preview = caption(voucher, "synthetic-id", { redactVoucherNumber: true });
+  assert.ok(preview.includes("Voucher: [redacted]"));
+  assert.ok(!preview.includes(CODE));
+  assert.ok(!preview.includes(FALLBACK));
   for (const id of ["", "../secret", "line\nbreak", "x".repeat(101)]) {
     assert.throws(() => caption(voucher, id), errorCode("INVALID_SOURCE_ID"));
   }
   assert.throws(() => caption({ ...voucher, retailer: "x".repeat(1024) }, "id"),
     errorCode("CAPTION_TOO_LONG"));
   assert.throws(() => decodeHtml("&#1114112;"), errorCode("INVALID_HTML_ENTITY"));
+});
+
+test("voucher numbers stay exact strings in captions and filenames, including leading zeros and long codes", () => {
+  for (const code of ["000123", "000000000000123456789012", "9".repeat(24)]) {
+    const voucher = parseVoucher(message({ html: html({ code }) }));
+    assert.equal(voucherFilename(voucher), `voucher-${code}.png`);
+    assert.ok(caption(voucher, "id").includes(`\nVoucher: ${code}\n`));
+  }
+  for (const code of [123456, "../123456", "123456\n", "1".repeat(25), "12345"]) {
+    const voucher = { ...parseVoucher(message()), code };
+    assert.throws(() => voucherFilename(voucher), errorCode("INVALID_VOUCHER_NUMBER"));
+    assert.throws(() => caption(voucher, "id"), errorCode("INVALID_VOUCHER_NUMBER"));
+  }
 });

@@ -85,12 +85,23 @@ export function parseVoucher(message) {
   };
 }
 
-export function caption(voucher, sourceId) {
+function voucherNumber(voucher) {
+  requireValue(typeof voucher.code === "string" && voucher.code.length >= 6 && voucher.code.length <= 24
+    && !/\D/.test(voucher.code), "INVALID_VOUCHER_NUMBER");
+  return voucher.code;
+}
+
+export function voucherFilename(voucher) {
+  return `voucher-${voucherNumber(voucher)}.png`;
+}
+
+export function caption(voucher, sourceId, { redactVoucherNumber = false } = {}) {
   requireValue(/^[a-zA-Z0-9_-]{1,100}$/.test(sourceId), "INVALID_SOURCE_ID");
+  const number = voucherNumber(voucher);
   const [year, month, day] = voucher.purchased.split("-");
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const value = (voucher.valueCents / 100).toFixed(2);
-  const result = `${voucher.retailer}\nValue: ${voucher.currency} ${value}\nPurchased: ${day} ${months[Number(month) - 1]} ${year}\nSource: ${sourceId}`;
+  const result = `${voucher.retailer}\nValue: ${voucher.currency} ${value}\nPurchased: ${day} ${months[Number(month) - 1]} ${year}\nVoucher: ${redactVoucherNumber ? "[redacted]" : number}\nSource: ${sourceId}`;
   requireValue(result.length <= 1024, "CAPTION_TOO_LONG");
   return result;
 }

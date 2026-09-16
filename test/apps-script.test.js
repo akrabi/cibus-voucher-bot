@@ -35,12 +35,14 @@ test("bundled Apps Script executes without Buffer and labels only the source mes
   assert.equal(request.init.muteHttpExceptions, true);
   assert.equal(request.init.payload.chat_id, "-123456");
   assert.equal(request.init.payload.document.getContentType(), "image/png");
-  assert.equal(request.init.payload.document.getName(), "voucher.png");
+  assert.equal(request.init.payload.document.getName(), `voucher-${CODE}.png`);
   assert.match(request.init.payload.caption, /^חנות בדיקה\nValue: ILS 123\.45\nPurchased: 16 Sep 2026/);
   const png = decode(Uint8Array.from(request.init.payload.document.getBytes(), b => b & 255));
   assert.deepEqual([png.width, png.height], [1064, 304]);
-  assert.ok(!request.init.payload.caption.includes(CODE));
+  assert.ok(request.init.payload.caption.includes(`Voucher: ${CODE}`));
   assert.ok(!request.init.payload.caption.includes(FALLBACK));
+  assert.ok(!JSON.stringify(r.operations("log")).includes(CODE));
+  assert.ok(!JSON.stringify(r.operations("error")).includes(CODE));
 });
 
 test("Gmail MIME HTML and attachment bytes survive signed byte APIs, including Hebrew UTF-8", () => {
@@ -54,17 +56,136 @@ test("Gmail MIME HTML and attachment bytes survive signed byte APIs, including H
     assert.ok(r.operations("blob").some(blob => blob.bytes.some(b => b < 0)), "exercise signed UTF-8 and PNG bytes");
     assert.ok(r.operations("blob").every(blob => blob.bytes.every(b => b >= -128 && b <= 127)));
     assert.ok(!retrieved.includes("never-download-logo"));
+    assert.equal(r.count("decode"), 0, "already-decoded byte arrays must not be Base64 decoded");
   }
 });
 
 test("inline base64url MIME image data works without downloading an attachment", () => {
-  const raw = mimeMessage();
+  const raw = mimeMessage("source-1", message(), { dataFormat: "base64" });
   const image = raw.payload.parts[1];
   image.body.data = raw.external[image.body.attachmentId];
   delete image.body.attachmentId;
   const r = runtime({ messages: [raw] });
   assert.equal(r.api.runImport()[0].status, "IMPORTED");
   assert.equal(r.count("attachment"), 0);
+});
+
+test("Gmail body decoding normalizes every unpadded remainder and preserves existing padding", () => {
+  for (const suffix of ["", " ", "  "]) {
+    for (const externalHtml of [false, true]) {
+      for (const padded of [false, true]) {
+        const raw = mimeMessage("source-1", message({ html: html() + suffix }), { externalHtml, dataFormat: "base64" });
+        const body = raw.payload.parts[0].parts[1].body;
+        const container = externalHtml ? raw.external : body;
+        const key = externalHtml ? body.attachmentId : "data";
+        if (padded) container[key] += "=".repeat((4 - container[key].length % 4) % 4);
+        const r = runtime({ messages: [raw] });
+        assert.equal(r.api.previewImport()[0].status, "READY");
+        assert.ok(r.operations("decode").every(e => e.data.length % 4 === 0));
+        assert.equal(r.count("modify"), 0);
+        assert.equal(r.count("telegram"), 0);
+      }
+    }
+  }
+});
+
+test("standard and URL-safe Base64 decode identically for bodies and attachments", () => {
+  for (const externalHtml of [false, true]) {
+    for (const alphabet of ["standard", "url-safe"]) {
+      for (const padding of [false, true]) {
+        for (const whitespace of [false, true]) {
+          const raw = mimeMessage("source-1", message({ html: html() + "<!-- \uFFFF\uFFFF -->" }),
+            { externalHtml, dataFormat: "base64" });
+          const convert = input => {
+            let encoded = Buffer.from(input, "base64url").toString("base64");
+            if (alphabet === "url-safe") encoded = encoded.replace(/\+/g, "-").replace(/\//g, "_");
+            if (!padding) encoded = encoded.replace(/=+$/, "");
+            if (whitespace) encoded = " \t" + encoded.replace(/.{60}/g, "$&\r\n") + "\n";
+            return encoded;
+          };
+          const body = raw.payload.parts[0].parts[1].body;
+          if (body.data) body.data = convert(body.data);
+          for (const key of Object.keys(raw.external)) raw.external[key] = convert(raw.external[key]);
+          const bodyData = body.data ?? raw.external[body.attachmentId];
+          assert.ok(alphabet === "standard" ? /[+/]/.test(bodyData) : /[-_]/.test(bodyData));
+          const r = runtime({ messages: [raw] });
+          const result = r.api.previewImport()[0];
+          assert.equal(result.status, "READY");
+          assert.match(result.caption, /Value: ILS 123\.45\nPurchased: 16 Sep 2026/);
+          assert.equal(r.count("modify"), 0);
+          assert.equal(r.count("telegram"), 0);
+          assert.ok(r.operations("decode").every(e => /^[A-Za-z0-9_-]*={0,2}$/.test(e.data)));
+        }
+      }
+    }
+  }
+});
+
+test("missing and malformed Gmail Base64 fail explicitly without logging the body", () => {
+  for (const [data, code] of [
+    [undefined, "MISSING_GMAIL_BODY_DATA"],
+    ["a", "INVALID_GMAIL_BODY_ENCODING"],
+    ["secret%body", "INVALID_GMAIL_BODY_ENCODING"],
+    ["abcd==", "INVALID_GMAIL_BODY_ENCODING"],
+    [1234, "INVALID_GMAIL_BODY_ENCODING"],
+  ]) {
+    const raw = mimeMessage();
+    raw.payload.parts[0].parts[1].body.data = data;
+    const r = runtime({ messages: [raw] });
+    const result = r.api.previewImport()[0];
+    assert.equal(result.reason, `PREPARING_${code}`);
+    assert.equal(r.count("telegram"), 0);
+    assert.equal(r.count("modify"), 0);
+    assert.ok(!JSON.stringify(r.operations("error")).includes("secret"));
+    const detail = r.operations("error").map(event => JSON.parse(event.text))
+      .find(event => event.code === "GMAIL_BODY_ENCODING_DETAILS");
+    if (data === undefined) {
+      assert.equal(detail, undefined);
+    } else {
+      assert.deepEqual(Object.keys(detail).sort(), [
+        "code", "dataType", "isArray", "lengthModuloFour", "source",
+        "standardAlphabet", "unexpectedCharacters", "urlSafeAlphabet", "whitespace",
+      ]);
+      assert.equal(detail.dataType, typeof data);
+    }
+  }
+});
+
+test("unsigned Gmail byte arrays preserve HTML and barcode bytes without decoding again", () => {
+  const raw = mimeMessage();
+  const body = raw.payload.parts[0].parts[1].body;
+  body.data = body.data.map(byte => byte & 255);
+  for (const key of Object.keys(raw.external)) raw.external[key] = raw.external[key].map(byte => byte & 255);
+  const r = runtime({ messages: [raw] });
+  const result = r.api.previewImport()[0];
+  assert.equal(result.status, "READY");
+  assert.match(result.caption, /Value: ILS 123\.45\nPurchased: 16 Sep 2026/);
+  assert.equal(r.count("decode"), 0);
+  assert.equal(r.count("modify"), 0);
+  assert.equal(r.count("telegram"), 0);
+});
+
+test("invalid or truncated Gmail byte arrays fail before parsing without exposing content", () => {
+  for (const [data, code] of [
+    [[-129], "INVALID_GMAIL_BODY_BYTES"],
+    [[256], "INVALID_GMAIL_BODY_BYTES"],
+    [[1.5], "INVALID_GMAIL_BODY_BYTES"],
+    [["secret"], "INVALID_GMAIL_BODY_BYTES"],
+    [[null], "INVALID_GMAIL_BODY_BYTES"],
+    [[NaN], "INVALID_GMAIL_BODY_BYTES"],
+    [[Infinity], "INVALID_GMAIL_BODY_BYTES"],
+    [new Array(2), "INVALID_GMAIL_BODY_BYTES"],
+    [[65], "GMAIL_BODY_SIZE_MISMATCH"],
+  ]) {
+    const raw = mimeMessage();
+    raw.payload.parts[0].parts[1].body.data = data;
+    const r = runtime({ messages: [raw] });
+    assert.equal(r.api.previewImport()[0].reason, `PREPARING_${code}`);
+    assert.equal(r.count("decode"), 0);
+    assert.equal(r.count("modify"), 0);
+    assert.equal(r.count("telegram"), 0);
+    assert.ok(!JSON.stringify(r.operations("error")).includes("secret"));
+  }
 });
 
 test("Gmail only downloads matching CID or filename images, never unrelated oversized logos", () => {
@@ -106,6 +227,9 @@ test("preview is usable while disabled, validates one candidate and performs no 
   const results = r.api.previewImport();
   assert.equal(results.length, 1);
   assert.equal(results[0].status, "READY");
+  assert.ok(results[0].caption.includes("Voucher: [redacted]"));
+  assert.ok(!JSON.stringify(results).includes(CODE));
+  assert.ok(!JSON.stringify(r.operations("log")).includes(CODE));
   assert.equal(r.count("telegram"), 0);
   assert.equal(r.count("modify"), 0);
   assert.equal(r.count("get"), 1);
@@ -317,18 +441,65 @@ test("busy script lock prevents concurrent imports and does not release another 
   assert.equal(r.count("warn"), 2);
 });
 
-test("schedule creation is idempotent, every five minutes, and preserves unrelated triggers", () => {
+test("schedule creation keeps one daily Israel-morning trigger and preserves unrelated triggers", () => {
   const r = runtime({ triggers: ["unrelatedHandler"] });
   r.api.enableSchedule();
   r.api.enableSchedule();
-  assert.equal(r.count("trigger-create"), 1);
-  assert.deepEqual(r.operations("trigger-minutes").map(e => e.minutes), [5]);
+  assert.equal(r.count("trigger-create"), 2);
+  assert.deepEqual(r.operations("trigger-hour").map(e => e.hour), [9, 9]);
+  assert.deepEqual(r.operations("trigger-days").map(e => e.days), [1, 1]);
+  assert.deepEqual(r.operations("trigger-timezone").map(e => e.timezone), ["Asia/Jerusalem", "Asia/Jerusalem"]);
   assert.deepEqual(r.triggers.map(t => t.getHandlerFunction()), ["unrelatedHandler", "runImport"]);
   r.api.disableSchedule();
   r.api.disableSchedule();
   assert.deepEqual(r.triggers.map(t => t.getHandlerFunction()), ["unrelatedHandler"]);
-  assert.equal(r.count("trigger-delete"), 1);
+  assert.equal(r.count("trigger-delete"), 2);
   assert.equal(r.count("telegram"), 0);
+});
+
+test("enableSchedule replaces existing legacy or duplicate importer triggers", () => {
+  const r = runtime({ triggers: ["runImport", "unrelatedHandler", "runImport"] });
+  const previous = [...r.triggers];
+  r.api.enableSchedule();
+  assert.deepEqual(r.triggers.map(t => t.getHandlerFunction()), ["unrelatedHandler", "runImport"]);
+  assert.ok(r.triggers.includes(previous[1]));
+  assert.ok(!r.triggers.includes(previous[0]));
+  assert.ok(!r.triggers.includes(previous[2]));
+  assert.equal(r.count("trigger-create"), 1);
+  assert.equal(r.count("trigger-delete"), 2);
+  assert.ok(r.events.findIndex(e => e.type === "trigger-create")
+    < r.events.findIndex(e => e.type === "trigger-delete"));
+});
+
+test("failed replacement creation leaves the existing schedule intact", () => {
+  const r = runtime({ triggers: ["runImport"], failTriggerCreate: true });
+  const original = r.triggers[0];
+  assert.throws(() => r.api.enableSchedule(), /synthetic trigger creation failure/);
+  assert.deepEqual(r.triggers, [original]);
+  assert.equal(r.count("trigger-delete"), 0);
+  assert.equal(r.count("unlock"), 1);
+});
+
+test("failed old-trigger deletion rolls back the new schedule and reports failure", () => {
+  let original;
+  const r = runtime({ triggers: ["runImport"], failTriggerDelete: trigger => trigger === original });
+  original = r.triggers[0];
+  assert.throws(() => r.api.enableSchedule(), /synthetic trigger deletion failure/);
+  assert.deepEqual(r.triggers, [original]);
+  assert.equal(r.count("trigger-create"), 1);
+  assert.equal(r.count("trigger-delete"), 2);
+  assert.equal(r.count("unlock"), 1);
+});
+
+test("scheduling changes do not race a running import or another scheduling change", () => {
+  const r = runtime({ triggers: ["runImport"], lockAvailable: false });
+  const original = r.triggers[0];
+  r.api.enableSchedule();
+  r.api.disableSchedule();
+  assert.deepEqual(r.triggers, [original]);
+  assert.equal(r.count("trigger-create"), 0);
+  assert.equal(r.count("trigger-delete"), 0);
+  assert.equal(r.count("warn"), 2);
 });
 
 test("schedule enablement requires config and disable removes all importer triggers without config", () => {

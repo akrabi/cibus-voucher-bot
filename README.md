@@ -2,11 +2,15 @@
 
 Send Cibus vouchers from a dedicated Gmail account into a private Telegram
 group. Each message contains an uncompressed barcode PNG, its value, retailer,
-and **purchase date**. Successfully imported emails are archived, not deleted.
+**purchase date**, and **voucher number**. The file is named
+`voucher-<voucher-number>.png`, using the exact number beneath the email's
+embedded barcode, including leading zeros. Successfully imported emails are
+archived, not deleted.
 After the cashier accepts a voucher, manually delete its Telegram message
 **for everyone**.
 
-Runs on Google Apps Script every five minutes. No server, database, webhook,
+Runs on Google Apps Script once daily, between 9 and 10 AM in `Asia/Jerusalem`
+(Israel time, including daylight-saving changes). No server, database, webhook,
 wallet UI, or inbound bot commands are required. Gmail retains delivery state
 and original vouchers. This project is not affiliated with Cibus or Pluxee.
 
@@ -29,6 +33,12 @@ enlarges it with nearest-neighbor sampling, and adds white margins. It uploads
 PNG using Telegram `sendDocument` to avoid photo compression. Telegram shows
 it as an image document; tap it to open the barcode. The importer does not
 generate or guess barcode contents.
+The Apps Script Gmail advanced service can return already-decoded byte arrays.
+Those bytes are validated and used directly, without a second Base64 decode.
+String responses in standard Base64 or Base64URL are normalized, validated, and
+padded before decoding. Both paths check the decoded length against Gmail's
+declared body size. ASCII whitespace is allowed in encoded text; malformed data
+still fails explicitly.
 
 Expiry is deliberately **not** extracted or calculated. Purchase date is not
 an expiry date. The bot does not verify merchant redemption or remaining
@@ -62,7 +72,7 @@ To also fetch the private fallback directly from the expected Cibus host:
 node .\scripts\inspect-email.js 'C:\private\voucher.eml' --fetch-fallback
 ```
 
-This reports the safe caption, output dimensions, and whether the normalized
+This reports the caption with the voucher number redacted, output dimensions, and whether the normalized
 attachment and fallback match. It never outputs the barcode number or private
 link, saves no images, and does not send anything to Telegram. Keep real emails
 and images outside the repository. Fixtures must be synthetic, not merely
@@ -75,21 +85,35 @@ renamed copies of real vouchers.
 2. Authenticate the local deployment tool with that account:
 
    ```powershell
-   .\node_modules\.bin\clasp.cmd login
+   npm.cmd run clasp -- login
    ```
+
+   On Google's permission screen, select **Create and update Google Apps Script
+   projects**. This is sufficient for creating this standalone project and
+   uploading code; leave Drive browsing, deployment, logging, web-app publishing,
+   service-management, and broad Google Cloud permissions unchecked. The
+   importer's Gmail/runtime permissions are authorized separately on first run.
 
 3. Create a standalone project. Do this **before** the first build/push for a
    new project; creation may write a generated manifest.
 
    ```powershell
-   .\node_modules\.bin\clasp.cmd create --type standalone --title cibus-voucher-bot --rootDir dist
+   npm.cmd run clasp -- create --type standalone --title cibus-voucher-bot --rootDir dist
    npm.cmd run build
-   .\node_modules\.bin\clasp.cmd show-file-status
-   .\node_modules\.bin\clasp.cmd push
+   npm.cmd run clasp -- show-file-status
+   npm.cmd run clasp -- push
    ```
+
+   For a newly created, empty remote project, clasp may ask to replace its
+   default manifest. Confirm that prompt. In a noninteractive terminal, use
+   `npm.cmd run clasp -- push --force` for this initial upload only. Do not
+   overwrite an existing project's manifest without reviewing the changes.
 
    Only `bundle.js`, `entrypoints.js`, and `appsscript.json` should be uploaded.
    `.clasp.json` and local authentication files are excluded from Git.
+   The project commands use the named `cibus-voucher-bot` login in the ignored
+   local `.clasprc.json`, not your default/global clasp credentials. Keep using
+   these commands for login, project creation, and deployment.
    If you already created the project, use its Script ID in a local
    `.clasp.json` with `"rootDir": "dist"` instead of creating another project.
    Do not use `clasp pull` as a source-editing workflow: edit `src` and rebuild.
@@ -129,14 +153,25 @@ scheduled-trigger management.
    $secret = Read-Host 'Bot token' -AsSecureString
    $token = [System.Net.NetworkCredential]::new('', $secret).Password
    try {
-     $response = Invoke-RestMethod -Uri ("https://api.telegram.org/bot{0}/getUpdates" -f $token)
-     $response.result | ForEach-Object { $_.message.chat } |
-       Where-Object { $_.type -in @('group', 'supergroup') } |
-       Select-Object -Unique id, type
+     $base = "https://api.telegram.org/bot$token"
+     $me = Invoke-RestMethod "$base/getMe"
+     Write-Host "Using bot: @$($me.result.username)"
+     $response = Invoke-RestMethod "$base/getUpdates"
+     $groups = @(
+       $response.result |
+         ForEach-Object { $_.message.chat; $_.my_chat_member.chat } |
+         Where-Object { $_.type -in @('group', 'supergroup') } |
+         Select-Object -Unique id, type
+     )
+     if ($groups.Count) {
+       $groups | Format-Table
+     } else {
+       Write-Host "No group found. Send /start@$($me.result.username) in the group, then retry."
+     }
    } catch {
      Write-Error 'Telegram lookup failed; verify the token and try again. Do not share raw errors.'
    } finally {
-     Remove-Variable token, secret, response -ErrorAction SilentlyContinue
+     Remove-Variable token, secret, base, me, response, groups -ErrorAction SilentlyContinue
    }
    ```
 
@@ -156,7 +191,8 @@ spendable secrets stored in Telegram's cloud; private membership is essential.
    scopes. This may create bookkeeping labels and fetch the Cibus image, but
    does not send to Telegram, change email labels, or archive messages.
    It reports `READY` with value, purchase date, and image dimensions, or a
-   safe review reason.
+   safe review reason. The voucher number appears as `[redacted]` in preview
+   output/logs; the real Telegram caption and document filename include it.
 3. Set `IMPORT_ENABLED` to `true` and run `runImport` manually. Check the image
    and caption on both phones. Verify that only the imported email left the
    inbox and remains under **Cibus/Imported** and **All Mail**.
@@ -168,13 +204,22 @@ spendable secrets stored in Telegram's cloud; private membership is essential.
    `שובר על סך` in its subject. Apply **Cibus/Candidate**, but **do not** select
    "Skip the Inbox". Do not apply it to all old conversations unless you have
    manually checked those vouchers.
-6. Run `enableSchedule` once to create a five-minute trigger. The function
-   avoids creating duplicate triggers. Review Apps Script **Executions** and
+6. Run `enableSchedule` once to create a daily trigger between 9 and 10 AM
+   Israel time. Google selects the exact time within that hour; it is not
+   guaranteed to run at 9:00 sharp. The function replaces existing importer
+   triggers, including older five-minute schedules, while preserving unrelated
+   triggers. Repeated calls leave one importer trigger. Uploading code alone
+   does not change an existing trigger: rerun `enableSchedule` after upgrading.
+   New vouchers normally wait until the next daily run; use `runImport`
+   manually for an immediate import when needed.
+   Review Apps Script **Executions** and
    **Cibus/Review-needed** regularly, including Google's trigger failure emails.
 
 Run `disableSchedule` to remove this project's importer triggers, and set
 `IMPORT_ENABLED=false` to prevent subsequent manual imports. Disabling does
 not cancel an already-running execution.
+Schedule changes share the import lock. If a command reports
+`IMPORT_ALREADY_RUNNING`, retry it after the current execution finishes.
 
 ## Delivery state and recovery
 
@@ -233,6 +278,11 @@ Review errors contain source IDs and fixed error codes, not email bodies,
 voucher numbers, tokens, private links, or raw HTTP responses. A failure to
 write the review label fails the execution visibly rather than pretending
 recovery succeeded.
+Unexpected errors also include the failing operation, a standard error type,
+and line numbers from the generated script. Raw exception messages and stack
+traces are not logged.
+Invalid body encodings report only their data type, length modulo four, and
+format flags (alphabet, whitespace, unexpected characters), never body content.
 
 ## Repository and deployment
 

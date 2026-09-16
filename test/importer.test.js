@@ -37,7 +37,9 @@ test("successful import claims before sending and archives only after sending", 
   assert.deepEqual(h.names(), ["getMessage", "voucherKey", "hasOtherSource", "claim", "send", "finalize"]);
   assert.deepEqual(h.calls.find(c => c.name === "claim").args, ["source-1", `synthetic-key:${CODE}`]);
   assert.equal(h.calls.find(c => c.name === "send").args[0].contentType, "image/png");
+  assert.equal(h.calls.find(c => c.name === "send").args[0].filename, `voucher-${CODE}.png`);
   assert.match(h.calls.find(c => c.name === "send").args[1], /Purchased: 16 Sep 2026/);
+  assert.ok(h.calls.find(c => c.name === "send").args[1].includes(`Voucher: ${CODE}`));
   assert.ok(h.source.labels.includes(LABELS.imported));
   assert.ok(!h.source.labels.includes("INBOX"));
   assert.ok(!h.source.labels.includes(LABELS.processing));
@@ -51,6 +53,8 @@ test("dry run validates and renders but never claims, sends, reviews or archives
   assert.equal(result.width, 1064);
   assert.equal(result.height, 304);
   assert.match(result.caption, /Value: ILS 123\.45/);
+  assert.ok(result.caption.includes("Voucher: [redacted]"));
+  assert.ok(!JSON.stringify(result).includes(CODE));
   assert.deepEqual(h.names(), ["getMessage", "voucherKey", "hasOtherSource"]);
   assert.deepEqual(h.source.labels, before);
 });
@@ -116,7 +120,23 @@ test("dry-run failures do not mutate Gmail and unexpected errors are redacted", 
   assert.equal(result.reason, "PREPARING_UNEXPECTED_ERROR");
   assert.deepEqual(h.names(), ["getMessage", "log"]);
   assert.ok(!JSON.stringify(result).includes("sensitive"));
-  assert.deepEqual(h.calls.find(c => c.name === "log").args, ["source-1", "PREPARING_UNEXPECTED_ERROR"]);
+  const args = h.calls.find(c => c.name === "log").args;
+  assert.deepEqual(args, ["source-1", "PREPARING_UNEXPECTED_ERROR",
+    { operation: "READ_EMAIL", type: "Error", locations: [] }]);
+  assert.ok(!JSON.stringify(args).includes("sensitive"));
+});
+
+test("unexpected failures log only operation, standard error type and script locations", () => {
+  const error = new TypeError("secret token and voucher URL");
+  error.stack = "TypeError: secret token and voucher URL\n"
+    + " at secretFunction (bundle:123:45)\n at anotherSecret (entrypoints.gs:2:3)\n"
+    + " at https://secret.example.invalid/voucher";
+  const h = harness({ fail: { voucherKey: error } });
+  importMessage("source-1", h.ports, { dryRun: true });
+  const args = h.calls.find(c => c.name === "log").args;
+  assert.deepEqual(args[2], { operation: "IDENTIFY_VOUCHER", type: "TypeError",
+    locations: ["bundle:123:45", "entrypoints:2:3"] });
+  assert.ok(!JSON.stringify(args).includes("secret"));
 });
 
 for (const code of ["TELEGRAM_DELIVERY_UNCERTAIN", "TELEGRAM_NOT_CONFIRMED"]) {

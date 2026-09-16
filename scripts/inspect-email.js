@@ -46,7 +46,8 @@ if (!path || (flag && flag !== "--fetch-fallback")) {
       return resources.get(url);
     };
     const image = voucherImage(voucher, attachments, fetchResource, code => console.warn(code));
-    const result = { caption: caption(voucher, "local-preview"), image: { width: image.width, height: image.height, bytes: image.bytes.length } };
+    const result = { caption: caption(voucher, "local-preview", { redactVoucherNumber: true }),
+      image: { width: image.width, height: image.height, bytes: image.bytes.length } };
     if (flag === "--fetch-fallback") {
       const fallback = voucherImage(voucher, [], fetchResource);
       result.fallback = { width: fallback.width, height: fallback.height, matchesAttachment: Buffer.from(image.bytes).equals(Buffer.from(fallback.bytes)) };
