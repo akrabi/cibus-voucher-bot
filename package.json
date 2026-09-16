@@ -1,0 +1,26 @@
+{
+  "name": "cibus-voucher-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Import Cibus voucher images from Gmail into a private Telegram group.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test",
+    "check": "npm test && npm run build",
+    "inspect-email": "node scripts/inspect-email.js",
+    "clasp": "clasp",
+    "push": "npm run build && clasp push"
+  },
+  "dependencies": {
+    "@sinonjs/text-encoding": "^0.7.3",
+    "fast-png": "^6.2.0",
+    "omggif": "^1.0.10"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "mailparser": "^3.7.0"
+  }
+}
